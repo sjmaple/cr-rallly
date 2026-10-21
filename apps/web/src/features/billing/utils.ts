@@ -28,6 +28,14 @@ export function isStripeResourceMissingError(error: unknown) {
   return isStripeErrorCode(error, "resource_missing");
 }
 
+export function isStripeInvalidRequestError(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { rawType?: unknown }).rawType === "invalid_request_error"
+  );
+}
+
 type PricingLike = Pick<PricingData, "monthly" | "yearly" | "earlySupporter">;
 
 /**

@@ -27,6 +27,7 @@ import { getStripe } from "@/features/billing/service";
 import {
   canChangeBillingInterval,
   isEarlySupporter,
+  isStripeInvalidRequestError,
   resolvePriceSet,
 } from "@/features/billing/utils";
 import { getActiveSpaceForUser } from "@/features/space/data";
@@ -115,53 +116,69 @@ export const upgradeToProAction = authActionClient
       nonprofitGrantedAt ? await ensureNonprofitCoupon() : null,
     );
 
-    const checkoutSession = await stripe.checkout.sessions.create({
-      success_url: absoluteUrl(returnPath ?? "/settings/billing"),
-      cancel_url: absoluteUrl(returnPath ?? "/settings/billing"),
-      customer: customerId,
-      customer_update: {
-        name: "auto",
-        address: "auto",
-      },
-      mode: "subscription",
-      // No currency hint: the pay wall price is indicative. Stripe picks the
-      // currency from the customer's billing history or their location, and
-      // rejects any hint that disagrees with a customer's existing currency.
-      ...discount.session,
-      billing_address_collection: "auto",
-      tax_id_collection: {
-        enabled: true,
-      },
-      metadata: {
-        userId: ctx.user.id,
-        spaceId: space.id,
-      } satisfies SubscriptionCheckoutMetadata,
-      subscription_data: {
+    const createCheckoutSession = (checkoutCurrency?: string) =>
+      stripe.checkout.sessions.create({
+        success_url: absoluteUrl(returnPath ?? "/settings/billing"),
+        cancel_url: absoluteUrl(returnPath ?? "/settings/billing"),
+        customer: customerId,
+        customer_update: {
+          name: "auto",
+          address: "auto",
+        },
+        mode: "subscription",
+        // Pin the pay wall currency so the subscription and invoices match it.
+        // Adaptive Pricing may still present a local amount, with this currency
+        // as the alternative.
+        currency: checkoutCurrency,
+        ...discount.session,
+        billing_address_collection: "auto",
+        tax_id_collection: {
+          enabled: true,
+        },
         metadata: {
           userId: ctx.user.id,
           spaceId: space.id,
-        } satisfies SubscriptionMetadata,
-      },
-      line_items: [
-        {
-          price:
-            period === "yearly"
-              ? proPricingData.yearly.id
-              : proPricingData.monthly.id,
-          quantity: 1,
+        } satisfies SubscriptionCheckoutMetadata,
+        subscription_data: {
+          metadata: {
+            userId: ctx.user.id,
+            spaceId: space.id,
+          } satisfies SubscriptionMetadata,
         },
-      ],
-      automatic_tax: {
-        enabled: true,
-      },
-      expires_at: Math.floor(Date.now() / 1000) + 30 * 60, // 30 minutes
-      after_expiration: {
-        recovery: {
+        line_items: [
+          {
+            price:
+              period === "yearly"
+                ? proPricingData.yearly.id
+                : proPricingData.monthly.id,
+            quantity: 1,
+          },
+        ],
+        automatic_tax: {
           enabled: true,
-          ...discount.recovery,
         },
+        expires_at: Math.floor(Date.now() / 1000) + 30 * 60, // 30 minutes
+        after_expiration: {
+          recovery: {
+            enabled: true,
+            ...discount.recovery,
+          },
+        },
+      });
+
+    // Stripe refuses a currency that conflicts with anything the customer
+    // still has open in another one (e.g. a subscription for another space),
+    // with no code or param to match on.
+    // Retrying without the hint lets Stripe pick the customer's currency; an
+    // unrelated invalid request fails again and is thrown.
+    const checkoutSession = await createCheckoutSession(currency).catch(
+      (error: unknown) => {
+        if (currency && isStripeInvalidRequestError(error)) {
+          return createCheckoutSession();
+        }
+        throw error;
       },
-    });
+    );
 
     if (!checkoutSession.url) {
       throw new AppError({
@@ -174,7 +191,7 @@ export const upgradeToProAction = authActionClient
       event: "billing:checkout_start",
       properties: {
         interval: period === "yearly" ? "year" : "month",
-        currency,
+        currency: checkoutSession.currency ?? currency,
         nonprofit_discount: Boolean(nonprofitGrantedAt),
       },
       groups: {
